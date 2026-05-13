@@ -44,6 +44,7 @@ training/logs/
 *.spec
 logs
 output
+outputs
 
 # Installer logs
 pip-log.txt
