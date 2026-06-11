@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+读取一个最终 fused .pt，沿 packet target trajectory 渲染。
+最基础、最稳定的渲染评估脚本。
+它和 custom pose / overlay 没关系，原逻辑应该保留。
+"""
+"""
 Render one fused/pruned Gaussian packet along the target-camera trajectory stored in original packet files.
 
 Use case

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+pre-P3 free-space deletion
+→ coverage-aware insertion
+→ P4 voxel top-k
+→ 输出最终 fused map
+"""
+"""
 P5++: footprint-depth free-space pruning + P4 redundancy control.
 
 This script is designed for the current ZipMap -> ReSplat packet workflow.

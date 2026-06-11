@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 跑 P8 还是用原 map_maintenance_p8_coverage_insert.py
+# 需要中间过程可视化时用这个 _save_steps.py 版本
 """
 P5++: footprint-depth free-space pruning + P4 redundancy control.
 

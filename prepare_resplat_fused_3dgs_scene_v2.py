@@ -1,5 +1,33 @@
 #!/usr/bin/env python3
 """
+ReSplat/ZipMap 输出的 gaussian packets
+→ initial_fused_3dgs.ply
+→ 3DGS 可读取的 transforms_train.json / transforms_test.json
+→ packet-camera scene
+也就是一个转换接口，把之前系统输出的高斯packets转换成原版3dgs可以读取的ply格式。
+
+命令：
+python prepare_resplat_fused_3dgs_scene_v2.py \
+  --packet_dir /home/shiyo/Desktop/ZipMap/outputs/api_demo_P000_0_30/gaussian_packets_api/final \
+  --packet_ranges 0-29 \
+  --dataset_start_index 0 \
+  --image_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_lcam_front \
+  --image_pattern "{index:06d}_lcam_front.png" \
+  --camera_source packet \
+  --packet_camera_convention twc_cv \
+  --packet_camera_view_index -1 \
+  --fx 320 \
+  --fy 320 \
+  --cx 320 \
+  --cy 320 \
+  --width 640 \
+  --height 640 \
+  --output_scene /home/shiyo/Desktop/ZipMap/outputs/api_demo_P000_0_30/3dgs_scene_packetcam \
+  --sh_degree 3 \
+  --test_same_as_train \
+  --copy_images
+"""
+"""
 Prepare an original graphdeco-inria/gaussian-splatting compatible scene
 from ReSplat/MVSplat-style Gaussian packet .pt files.
 
@@ -18,8 +46,8 @@ Typical use:
     --packet_ranges 0-19 \
     --image_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_lcam_front \
     --image_pattern "{index:06d}_lcam_front.png" \
-    --pose_file /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/pose_lcam_front.txt \
-    --pose_format tartanair_twc \
+    --camera_source packet \
+    --packet_camera_convention twc_cv \
     --fx 320 --fy 320 --cx 320 --cy 320 --width 640 --height 640 \
     --output_scene /home/shiyo/Desktop/ZipMap/outputs/api_demo_P000_0_20/3dgs_scene \
     --sh_degree 3
@@ -530,40 +558,174 @@ def cv_twc_to_nerf_transform(Twc_cv: np.ndarray, rotation_mode: str) -> np.ndarr
     return Twc_cv @ cv_to_gl
 
 
-def copy_images_and_write_transforms(args: argparse.Namespace, frame_indices: List[int], output_scene: Path) -> Dict[str, Any]:
+def matrix_to_nerf_transform(M: np.ndarray, convention: str) -> np.ndarray:
+    """Convert a packet camera matrix to the OpenGL/NeRF c2w transform expected by transforms_*.json.
+
+    Supported conventions:
+      - twc_cv:     camera-to-world, OpenCV camera axes: x right, y down, z forward
+      - tcw_cv:     world-to-camera, OpenCV camera axes
+      - twc_opengl: camera-to-world, OpenGL/NeRF axes: x right, y up, z backward
+      - tcw_opengl: world-to-camera, OpenGL/NeRF axes
+    """
+    M = np.asarray(M, dtype=np.float32)
+    if M.shape != (4, 4):
+        raise ValueError(f"Expected 4x4 camera matrix, got {M.shape}")
+    if convention == 'twc_cv':
+        return M @ np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+    if convention == 'tcw_cv':
+        return np.linalg.inv(M) @ np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+    if convention in {'twc_opengl', 'twc_nerf'}:
+        return M
+    if convention in {'tcw_opengl', 'tcw_nerf'}:
+        return np.linalg.inv(M)
+    raise ValueError(f"Unknown packet_camera_convention: {convention}")
+
+
+def choose_camera_matrix(packet: Any, explicit: Optional[str]) -> Tuple[str, torch.Tensor]:
+    """Find a candidate 4x4 camera matrix tensor inside a packet."""
+    if explicit:
+        val = get_by_path(packet, explicit)
+        if not isinstance(val, torch.Tensor):
+            val = torch.as_tensor(val)
+        return explicit, val
+
+    candidates = [
+        'target.extrinsics', 'target.extrinsic', 'target.pose', 'target.c2w', 'target.twc',
+        'extrinsics', 'extrinsic', 'camera_to_world', 'c2w', 'cam2world', 'world_from_cam', 'twc',
+        'w2c', 'world_to_camera', 'camera_from_world', 'pose', 'poses', 'camera_pose', 'camera_poses',
+    ]
+    scored: List[Tuple[int, str, torch.Tensor]] = []
+    for path, t in walk_tensors(packet):
+        if t.ndim < 2 or tuple(t.shape[-2:]) != (4, 4):
+            continue
+        p = path.lower()
+        # Exclude unrelated transforms if obvious.
+        if any(bad in p for bad in ['augmentation', 'crop', 'resize', 'normalize']):
+            continue
+        score = 0
+        for c in candidates:
+            if c in p:
+                score += 10 + len(c)
+        if 'target' in p:
+            score += 8
+        if 'context' in p:
+            score -= 4
+        if 'extrinsic' in p:
+            score += 6
+        if 'pose' in p:
+            score += 4
+        score -= path.count('.')
+        if score > 0:
+            scored.append((score, path, t))
+    if not scored:
+        raise KeyError("Could not infer packet camera matrix. Use --packet_camera_key or run --inspect_only.")
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return scored[0][1], scored[0][2]
+
+
+def select_matrix_from_tensor(t: torch.Tensor, view_index: int) -> np.ndarray:
+    arr = tensor_to_numpy(t).astype(np.float32)
+    if tuple(arr.shape[-2:]) != (4, 4):
+        raise ValueError(f"Camera tensor must end with 4x4, got {arr.shape}")
+    mats = arr.reshape(-1, 4, 4)
+    if mats.shape[0] == 0:
+        raise ValueError("Empty camera matrix tensor")
+    idx = view_index
+    if idx < 0:
+        idx = mats.shape[0] + idx
+    if idx < 0 or idx >= mats.shape[0]:
+        raise IndexError(f"packet_camera_view_index {view_index} out of range for {mats.shape[0]} matrices")
+    return mats[idx]
+
+
+def packet_camera_to_frame(packet: Any, args: argparse.Namespace, image_file_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    cam_path, cam_t = choose_camera_matrix(packet, args.packet_camera_key)
+    M = select_matrix_from_tensor(cam_t, args.packet_camera_view_index)
+    T_nerf = matrix_to_nerf_transform(M, args.packet_camera_convention)
+    frame = {
+        'file_path': image_file_path,
+        'transform_matrix': T_nerf.tolist(),
+    }
+    info = {
+        'camera_key': cam_path,
+        'camera_tensor_shape': list(cam_t.shape),
+        'camera_view_index': args.packet_camera_view_index,
+        'camera_convention': args.packet_camera_convention,
+        'camera_center_raw': M[:3, 3].astype(float).tolist(),
+    }
+    return frame, info
+
+
+def copy_images_and_write_transforms(args: argparse.Namespace, frame_indices: List[int], output_scene: Path, packet_files: Optional[List[Path]] = None) -> Dict[str, Any]:
     image_out = output_scene / 'images'
     image_out.mkdir(parents=True, exist_ok=True)
-    poses = read_pose_file(Path(args.pose_file), args.pose_format)
+
+    if args.camera_source == 'pose_file':
+        if not args.pose_file:
+            raise ValueError('--pose_file is required when --camera_source pose_file')
+        poses = read_pose_file(Path(args.pose_file), args.pose_format)
+    else:
+        poses = None
+        if packet_files is None:
+            raise ValueError('packet_files must be provided when --camera_source packet')
+        if len(packet_files) != len(frame_indices):
+            raise ValueError('packet_files and frame_indices length mismatch')
 
     fovx = 2.0 * math.atan(args.width / (2.0 * args.fx))
     frames = []
     missing = []
+    camera_infos = []
+
     for local_i, idx in enumerate(frame_indices):
         src = Path(args.image_dir) / args.image_pattern.format(index=idx, local_index=local_i)
         if not src.exists():
             missing.append(str(src))
             continue
-        # verify/optionally resize? keep original to avoid color changes
         with Image.open(src) as im:
             w, h = im.size
         if args.strict_image_size and (w != args.width or h != args.height):
             raise ValueError(f"Image size mismatch for {src}: got {w}x{h}, expected {args.width}x{args.height}")
+
         name = f"{idx:06d}.png"
         dst = image_out / name
         if args.copy_images:
             shutil.copyfile(src, dst)
         else:
-            # symlink uses relative target where possible
             if dst.exists() or dst.is_symlink():
                 dst.unlink()
             os.symlink(os.path.abspath(src), dst)
-        if idx not in poses:
-            raise KeyError(f"Pose index {idx} not found in {args.pose_file}")
-        T_nerf = cv_twc_to_nerf_transform(poses[idx], args.pose_rotation_mode)
-        frames.append({
-            'file_path': f"images/{idx:06d}",
-            'transform_matrix': T_nerf.tolist(),
-        })
+
+        image_file_path = f"images/{idx:06d}"
+
+        if args.camera_source == 'pose_file':
+            assert poses is not None
+            if idx not in poses:
+                raise KeyError(f"Pose index {idx} not found in {args.pose_file}")
+            T_nerf = cv_twc_to_nerf_transform(poses[idx], args.pose_rotation_mode)
+            frames.append({
+                'file_path': image_file_path,
+                'transform_matrix': T_nerf.tolist(),
+            })
+            camera_infos.append({
+                'frame_index': idx,
+                'camera_source': 'pose_file',
+                'camera_key': args.pose_file,
+                'camera_convention': f'{args.pose_format}/{args.pose_rotation_mode}',
+                'camera_center_raw': poses[idx][:3, 3].astype(float).tolist(),
+            })
+        elif args.camera_source == 'packet':
+            packet = safe_torch_load(packet_files[local_i])
+            frame, info = packet_camera_to_frame(packet, args, image_file_path)
+            frames.append(frame)
+            info.update({
+                'frame_index': idx,
+                'packet_file': str(packet_files[local_i]),
+                'camera_source': 'packet',
+            })
+            camera_infos.append(info)
+        else:
+            raise ValueError(f"Unknown camera_source: {args.camera_source}")
+
     if missing:
         raise FileNotFoundError("Missing images:\n" + "\n".join(missing[:20]) + ("\n..." if len(missing) > 20 else ""))
 
@@ -585,10 +747,15 @@ def copy_images_and_write_transforms(args: argparse.Namespace, frame_indices: Li
     (output_scene / 'transforms_test.json').write_text(json.dumps(meta_test, indent=2))
     print(f"[write] transforms_train.json: {len(train_frames)} frames")
     print(f"[write] transforms_test.json:  {len(test_frames)} frames")
+    if camera_infos:
+        first = camera_infos[0]
+        print(f"[camera] source={args.camera_source}, first_key={first.get('camera_key')}, first_center={first.get('camera_center_raw')}")
     return {
         'num_train_frames': len(train_frames),
         'num_test_frames': len(test_frames),
         'camera_angle_x': fovx,
+        'camera_source': args.camera_source,
+        'camera_infos': camera_infos,
     }
 
 
@@ -604,7 +771,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # image/camera
     p.add_argument('--image_dir', required=True)
     p.add_argument('--image_pattern', default='{index:06d}.png')
-    p.add_argument('--pose_file', required=True)
+    p.add_argument('--pose_file', default=None)
     p.add_argument('--pose_format', choices=['tartanair_twc', 'tum_twc'], default='tartanair_twc')
     p.add_argument('--pose_rotation_mode', choices=['c2w', 'w2c'], default='c2w')
     p.add_argument('--fx', type=float, required=True)
@@ -617,6 +784,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument('--strict_image_size', action='store_true')
     p.add_argument('--test_every', type=int, default=0, help='0 = no held-out test; N = every Nth selected frame as test')
     p.add_argument('--test_same_as_train', action='store_true')
+    p.add_argument('--camera_source', choices=['pose_file', 'packet'], default='pose_file',
+                   help='pose_file = use external pose file; packet = use camera matrix stored in each packet, recommended for fused-packet baseline')
+    p.add_argument('--packet_camera_key', default=None,
+                   help='Explicit tensor path for packet camera matrix, e.g. target.extrinsics or cameras.extrinsics')
+    p.add_argument('--packet_camera_view_index', type=int, default=-1,
+                   help='If the packet camera tensor contains multiple 4x4 matrices, select this flattened index. -1 usually means target/last view.')
+    p.add_argument('--packet_camera_convention', choices=['twc_cv', 'tcw_cv', 'twc_opengl', 'tcw_opengl', 'twc_nerf', 'tcw_nerf'], default='twc_cv',
+                   help='Convention of packet camera matrix. Most MVSplat/ReSplat-style tensors use twc_cv/camera-to-world.')
 
     # Gaussian conversion
     p.add_argument('--sh_degree', type=int, default=3)
@@ -687,7 +862,7 @@ def main() -> None:
     write_pointcloud_ply(points_ply, fused.xyz, fused.f_dc)
 
     frame_indices = [args.dataset_start_index + pi for pi in packet_indices]
-    cam_summary = copy_images_and_write_transforms(args, frame_indices, output_scene)
+    cam_summary = copy_images_and_write_transforms(args, frame_indices, output_scene, [packet_files_all[pi] for pi in packet_indices])
 
     summary = {
         'packet_dir': str(packet_dir),

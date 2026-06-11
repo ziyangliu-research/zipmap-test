@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 可视化 P5++ 到底删了哪些高斯
 """
 Diagnostic visualization for P5++ footprint free-space pruning.
 

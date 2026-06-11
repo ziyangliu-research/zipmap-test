@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
-# 最基础全流程运行脚本
+# zipmap流式传输，完整版本
 # TartanAir stereo → ZipMap pose/depth → ReSplat Gaussian packets → fusion/render
-# 关键在于Zipmap是离线运行的
+# 添加了选取resplat输出的init高斯进行融合的功能
 """
 命令：
-python run_zipmap_resplat_fusion_api.py \
-    --zipmap_repo /home/shiyo/Desktop/ZipMap \
-    --resplat_repo /home/shiyo/Desktop/Resplat \
-    --zipmap_ckpt /home/shiyo/Desktop/ZipMap/checkpoints/checkpoint_aff_inv.pt \
-    --left_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_lcam_front \
-    --right_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_rcam_front \
-    --gt_pose_file /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/pose_lcam_front.txt \
-    --work_dir /home/shiyo/Desktop/ZipMap/outputs/api_demo_P000_0_80_raw \
-    --start_index 0 \
-    --end_index 80 \
-    --scene_name P000 \
-    --resplat_experiment tartanair_p000_ft \
-    --resplat_packet_stage final \
-    --packet_stage_for_fusion final \
-    --fusion_probe_mode packet_trajectory \
-    --trajectory_render_chunk_size 1 \
-    --device cuda:0
+TORCH_COMPILE_DISABLE=1 python run_zipmap_resplat_fusion_api_official_streaming_merged_init_fast.py \
+  --zipmap_repo /home/shiyo/Desktop/ZipMap \
+  --resplat_repo /home/shiyo/Desktop/Resplat \
+  --zipmap_ckpt /home/shiyo/Desktop/ZipMap/checkpoints/checkpoint_online.pt \
+  --left_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_lcam_front \
+  --right_dir /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/image_rcam_front \
+  --gt_pose_file /home/shiyo/Desktop/Datasets/tartanair_v2/House/Data_easy/P000/pose_lcam_front.txt \
+  --work_dir /home/shiyo/Desktop/ZipMap/outputs/api_official_streaming_resplat_P000_0_50_init_fast \
+  --start_index 0 \
+  --end_index 50 \
+  --scene_name P000 \
+  --resplat_experiment tartanair_p000_ft \
+  --resplat_packet_stage init \
+  --packet_stage_for_fusion init \
+  --fusion_probe_mode packet_trajectory \
+  --trajectory_render_chunk_size 1 \
+  --device cuda:0 \
+  --pose_alignment sim3 \
+  --resplat_pose_source aligned \
+  --save_zipmap_depth false \
+  --save_zipmap_points false
 """
 """
-API-style ZipMap -> ReSplat packet -> Gaussian prefix-fusion pipeline.
+API-style official ZipMap-Streaming -> ReSplat packet -> Gaussian prefix-fusion pipeline.
 
 This is intentionally different from the older command-wrapper script:
   - ZipMap is called as Python functions, not as a subprocess.
@@ -57,7 +61,7 @@ Notes:
 
 from __future__ import annotations
 
-SCRIPT_VERSION = "2026-05-10-v3-trajectory-chunked-render"
+SCRIPT_VERSION = "2026-06-05-v4-official-streaming-zipmap-ar"
 
 import argparse
 import contextlib
@@ -380,7 +384,102 @@ def select_stereo_frames(
     return SelectedStereoFrames(indices, left_paths, right_paths, frame_records, stereo_pairs)
 
 
+OFFICIAL_STREAMING_MODEL_CONFIG = {
+    "img_size": 518,
+    "patch_size": 14,
+    "embed_dim": 1024,
+    "enable_camera": False,
+    "enable_camera_mlp": True,
+    "enable_local_point": True,
+    "enable_depth": True,
+    "ttt_config": {
+        "ttt_mode": True,
+        "params": {
+            "bias": True,
+            "head_dim": 1024,
+            "inter_multi": 2,
+            "base_lr": 0.01,
+            "muon_update_steps": 5,
+            "use_gate_fn": True,
+        },
+        "window_size": 1,
+    },
+    "other_config": {
+        "use_gradient_checkpointing_local_point": False,
+        "use_gradient_checkpointing_depth": False,
+        "affine_invariant": True,
+    },
+}
+
+
+def cuda_sync(device: torch.device) -> None:
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def timed_cuda(device: torch.device, fn):
+    cuda_sync(device)
+    t0 = time.perf_counter()
+    out = fn()
+    cuda_sync(device)
+    return out, time.perf_counter() - t0
+
+
+def tensor_to_np_no_batch(x: torch.Tensor) -> np.ndarray:
+    arr = x.detach().cpu().float().numpy()
+    if arr.ndim >= 1 and arr.shape[0] == 1:
+        arr = np.squeeze(arr, axis=0)
+    return arr
+
+
+def load_official_streaming_zipmap_ar(args: argparse.Namespace, zipmap_repo: Path, device: torch.device):
+    """Load the exact ZipMap_AR model path used by demo_gradio_zipmap_streaming.py."""
+    sys.path.insert(0, str(zipmap_repo))
+    from zipmap.models.ZipMap_AR import ZipMap
+
+    # Deep copy without importing copy.
+    model_config = json.loads(json.dumps(OFFICIAL_STREAMING_MODEL_CONFIG))
+    model_config["other_config"]["affine_invariant"] = bool(args.zipmap_affine_invariant)
+
+    model = ZipMap(**model_config)
+
+    ckpt_path = abs_path(args.zipmap_ckpt)
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+
+    if args.zipmap_ema and isinstance(checkpoint, dict) and "ema" in checkpoint:
+        state_dict = checkpoint["ema"]
+        log("[ZipMap-AR] using EMA weights")
+    elif isinstance(checkpoint, dict) and "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        log(f"[ZipMap-AR] missing keys: {missing}")
+    if unexpected:
+        log(f"[ZipMap-AR] unexpected keys: {unexpected}")
+
+    model.eval().to(device)
+    return model, model_config
+
+
 def run_zipmap_api(args: argparse.Namespace, selected: SelectedStereoFrames) -> ZipMapResult:
+    """
+    Official ZipMap streaming-demo pose stage.
+
+    This replaces the old offline ZipMap stage with:
+        ZipMap_AR + checkpoint_online.pt + model(images)
+
+    Important:
+      - This is the official Gradio streaming-demo inference path, run headlessly.
+      - It is still a single batch forward over selected left images.
+      - ReSplat consumes the resulting poses in memory via ZipMapResult.
+      - Pose/depth/point files are saved only for inspection and reproducibility.
+    """
     zipmap_repo = abs_path(args.zipmap_repo)
     zipmap_out = abs_path(args.work_dir) / args.zipmap_out_name
     zipmap_out.mkdir(parents=True, exist_ok=True)
@@ -400,34 +499,62 @@ def run_zipmap_api(args: argparse.Namespace, selected: SelectedStereoFrames) -> 
         homogenize_points,
     )
 
-    device_str = "cuda" if torch.cuda.is_available() and not args.zipmap_cpu else "cpu"
-    if device_str != "cuda":
-        raise RuntimeError("ZipMap inference is expected to run on CUDA. Use --zipmap_cpu only if your ZipMap supports CPU.")
+    device = torch.device(args.device)
+    if device.type != "cuda" or not torch.cuda.is_available() or args.zipmap_cpu:
+        raise RuntimeError(
+            f"ZipMap_AR official streaming path expects CUDA. "
+            f"Requested device={args.device}, zipmap_cpu={args.zipmap_cpu}, cuda_available={torch.cuda.is_available()}"
+        )
 
-    log(f"[1/4] ZipMap: loading {len(selected.left_paths)} left images")
-    zargs = SimpleNamespace(
-        ckpt_path=str(abs_path(args.zipmap_ckpt)),
-        affine_invariant=args.zipmap_affine_invariant,
-        ema=args.zipmap_ema,
-    )
+    log(f"[1/4] ZipMap-AR official streaming path: loading {len(selected.left_paths)} left images")
+
     with temporary_cwd(zipmap_repo):
-        model, model_config = export_mod.load_zipmap_model(zargs, device_str)
+        model, model_config = load_official_streaming_zipmap_ar(args, zipmap_repo, device)
+
         image_names = [str(p) for p in selected.left_paths]
-        images = load_and_preprocess_images(
-            image_names,
-            target_size=args.zipmap_target_size,
-            mode=args.zipmap_preprocess_mode,
-        ).to(device_str)
 
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
-            predictions_raw = model(images)
+        def preprocess():
+            return load_and_preprocess_images(
+                image_names,
+                target_size=args.zipmap_target_size,
+                mode=args.zipmap_preprocess_mode,
+            ).to(device)
 
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions_raw["pose_enc"], images.shape[-2:])
-        predictions_raw["extrinsic"] = extrinsic
-        predictions_raw["intrinsic"] = intrinsic
+        images, preprocess_sec = timed_cuda(device, preprocess)
+        log(f"      preprocess: images={tuple(images.shape)}, time={preprocess_sec:.4f}s")
 
-    pred = export_mod.sanitize_predictions_for_npz(predictions_raw)
+        def infer():
+            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=dtype):
+                return model(images)
+
+        predictions_raw, infer_sec = timed_cuda(device, infer)
+        log(f"      infer: time={infer_sec:.4f}s")
+
+        def decode_pose():
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions_raw["pose_enc"], images.shape[-2:])
+            predictions_raw["extrinsic"] = extrinsic
+            predictions_raw["intrinsic"] = intrinsic
+            return extrinsic, intrinsic
+
+        (extrinsic, intrinsic), postprocess_sec = timed_cuda(device, decode_pose)
+        log(f"      pose decode: time={postprocess_sec:.4f}s")
+
+    # Keep only fields required by downstream ReSplat and optional ZipMap inspection.
+    pred: dict[str, np.ndarray] = {
+        "extrinsic": tensor_to_np_no_batch(extrinsic).astype(np.float32),
+        "intrinsic": tensor_to_np_no_batch(intrinsic).astype(np.float32),
+    }
+
+    # Optional depth/point outputs. These are not required by ReSplat packet generation,
+    # but they preserve the old script's inspection behavior.
+    if args.save_zipmap_depth and "depth" in predictions_raw and torch.is_tensor(predictions_raw["depth"]):
+        pred["depth"] = tensor_to_np_no_batch(predictions_raw["depth"]).astype(np.float32)
+    if args.save_zipmap_points:
+        for key in ("depth", "depth_conf", "local_points", "local_points_conf"):
+            if key in predictions_raw and torch.is_tensor(predictions_raw[key]):
+                pred[key] = tensor_to_np_no_batch(predictions_raw[key]).astype(np.float32)
+
     T_w2c_cv = export_mod.to_homogeneous_4x4(pred["extrinsic"].astype(np.float32))
     if args.zipmap_align_first_view:
         T_w2c_cv = export_mod.align_w2c_to_first_camera(T_w2c_cv)
@@ -435,11 +562,11 @@ def run_zipmap_api(args: argparse.Namespace, selected: SelectedStereoFrames) -> 
     T_c2w_cv = export_mod.invert_se3_np(T_w2c_cv).astype(np.float32)
     intrinsics = pred["intrinsic"].astype(np.float32)
 
-    if "depth" in pred:
+    if args.save_zipmap_points and "depth" in pred:
         pred["world_points_from_depth"] = unproject_depth_map_to_point_map(
             pred["depth"], pred["extrinsic"], intrinsics, if_c2w=False
         ).astype(np.float32)
-    if "local_points" in pred:
+    if args.save_zipmap_points and "local_points" in pred:
         cam_to_world = closed_form_inverse_se3(pred["extrinsic"]).astype(np.float32)
         local_points = pred["local_points"].astype(np.float32)
         world_points = np.einsum("sij,shwj->shwi", cam_to_world, homogenize_points(local_points))
@@ -482,6 +609,18 @@ def run_zipmap_api(args: argparse.Namespace, selected: SelectedStereoFrames) -> 
             if key in pred:
                 np.save(points_dir / f"{key}.npy", pred[key].astype(np.float32))
 
+    timing_summary = {
+        "mode": "official_streaming_demo_batch_ZipMap_AR",
+        "num_frames": len(selected.left_paths),
+        "preprocess_sec": float(preprocess_sec),
+        "infer_sec": float(infer_sec),
+        "pose_decode_sec": float(postprocess_sec),
+        "total_zipmap_sec": float(preprocess_sec + infer_sec + postprocess_sec),
+        "infer_sec_per_frame": float(infer_sec / max(1, len(selected.left_paths))),
+        "total_zipmap_sec_per_frame": float((preprocess_sec + infer_sec + postprocess_sec) / max(1, len(selected.left_paths))),
+    }
+    save_json(zipmap_out / "timing_summary.json", timing_summary)
+
     meta = {
         "left_dir": str(abs_path(args.left_dir)),
         "right_dir": str(abs_path(args.right_dir)),
@@ -497,8 +636,15 @@ def run_zipmap_api(args: argparse.Namespace, selected: SelectedStereoFrames) -> 
         "align_first_view": args.zipmap_align_first_view,
         "affine_invariant": args.zipmap_affine_invariant,
         "ckpt_path": str(abs_path(args.zipmap_ckpt)),
+        "zipmap_model_type": "ZipMap_AR",
         "zipmap_model_config": model_config,
+        "timing": timing_summary,
         "array_shapes": {k: list(v.shape) for k, v in pred.items() if isinstance(v, np.ndarray)},
+        "note": (
+            "ZipMap stage has been replaced by the official streaming Gradio demo core path: "
+            "ZipMap_AR + checkpoint_online.pt + model(images). "
+            "ReSplat consumes raw_T_c2w_cv/aligned_T_c2w_cv directly in memory."
+        ),
     }
     save_json(zipmap_out / "meta.json", meta)
 
@@ -537,6 +683,7 @@ def run_zipmap_api(args: argparse.Namespace, selected: SelectedStereoFrames) -> 
                 "t": t_align.tolist(),
                 "ate": ate,
                 "rpe": rpe,
+                "timing": timing_summary,
             },
         )
         # lightweight CSVs for later inspection
@@ -557,11 +704,17 @@ def run_zipmap_api(args: argparse.Namespace, selected: SelectedStereoFrames) -> 
             "scale": float(scale),
             "ate": ate,
             "rpe": rpe,
+            "timing": timing_summary,
         }
         log(
             f"      pose alignment={args.pose_alignment}, scale={scale:.6f}, "
             f"ATE_RMSE={ate['rmse']:.6f}"
         )
+
+    # Release ZipMap model and big tensors before loading/running ReSplat.
+    del model, predictions_raw, extrinsic, intrinsic, images
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return ZipMapResult(
         out_dir=zipmap_out,
@@ -941,27 +1094,30 @@ def infer_resplat_packets(
                 if args.save_packets:
                     torch.save(pkt, packet_out_root / ("init" if stage_request == "both" else "init") / f"{scene_key}.pt")
 
-            gaussians_final = gaussians_init
-            if getattr(model.encoder.cfg, "num_refine", 0) > 0:
-                if condition_features is None:
-                    raise RuntimeError(
-                        "encoder.num_refine > 0 but encoder output did not contain condition_features. "
-                        "Check model.encoder.return_depth / ReSplat config."
-                    )
-                # target rendering is not needed to update Gaussians; update uses context-view render error.
-                refine_out = model.encoder.forward_update(
-                    batch["context"],
-                    None,
-                    condition_features,
-                    gaussians_init,
-                    model.decoder,
-                    batch.get("context_remain", None),
-                )
-                if len(refine_out["gaussian"]) == 0:
-                    raise RuntimeError("forward_update returned no gaussian outputs.")
-                gaussians_final = refine_out["gaussian"][-1]
-
+            # Only run ReSplat refinement when final packets are requested.
+            # If stage_request == "init", use the raw encoder output directly and skip
+            # forward_update completely. This avoids wasting time and avoids saving final packets.
             if stage_request in {"final", "both"}:
+                gaussians_final = gaussians_init
+                if getattr(model.encoder.cfg, "num_refine", 0) > 0:
+                    if condition_features is None:
+                        raise RuntimeError(
+                            "encoder.num_refine > 0 but encoder output did not contain condition_features. "
+                            "Check model.encoder.return_depth / ReSplat config."
+                        )
+                    # target rendering is not needed to update Gaussians; update uses context-view render error.
+                    refine_out = model.encoder.forward_update(
+                        batch["context"],
+                        None,
+                        condition_features,
+                        gaussians_init,
+                        model.decoder,
+                        batch.get("context_remain", None),
+                    )
+                    if len(refine_out["gaussian"]) == 0:
+                        raise RuntimeError("forward_update returned no gaussian outputs.")
+                    gaussians_final = refine_out["gaussian"][-1]
+
                 pkt = make_packet_from_gaussians(gaussians_final, batch, model.decoder, stage="final")
                 packet_groups["final"].append(pkt)
                 if args.save_packets:
@@ -1632,7 +1788,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--resplat_override", action="append", default=[], help="Hydra override for model/config only. Not used for dataset sampling.")
     ap.add_argument("--resplat_checkpoint", default=None, help="Override checkpointing.pretrained_model.")
     ap.add_argument("--resplat_out_name", default="resplat_runtime")
-    ap.add_argument("--resplat_pose_source", choices=["aligned", "raw"], default="raw")
+    ap.add_argument("--resplat_pose_source", choices=["aligned", "raw"], default="aligned")
     ap.add_argument("--resplat_packet_stage", choices=["init", "final", "both"], default="final")
     ap.add_argument("--packet_stage_for_fusion", choices=["init", "final"], default="final")
     ap.add_argument("--resplat_target_camera", choices=["left", "right", "both"], default="left")
