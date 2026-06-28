@@ -1,0 +1,375 @@
+--- train_resplat_3dgs_incremental_local_map_v3_visualization.py
++++ train_resplat_3dgs_incremental_local_map_v4_maintenance_visualization.py
+@@ -19,7 +19,9 @@
+   - Test images are never used to compute training loss.
+   - Test cameras are used only for evaluation.
+   - Existing Global Map opacity is never globally reset.
+-  - No replay loss, isotropic regularization, densification, or pruning is used.
++  - No replay loss or isotropic regularization is used.
++  - Optional standard GraphDECO densification + pruning can be executed once
++    per inserted train packet at a user-selected local iteration.
+   - All currently inserted Gaussians and all standard Gaussian parameters remain
+     trainable; the optimization views are restricted to the recent local map.
+   - Appending a packet preserves optimizer state for existing Gaussians and
+@@ -38,7 +40,15 @@
+   - Chase-camera View: generated from each current camera local frame.
+   - First-person View: rendered from the exact current input camera pose and intrinsics.
+   - For every selected train packet, render after insertion/reset (before optimization)
+-    and after the local-map optimization. No intermediate Global PLY is required.
++    and after the local-map optimization/maintenance. No intermediate Global PLY is required.
++
++Maintenance experiment protocol:
++  - Accumulate standard GraphDECO screen-space gradient/radius statistics from
++    local iterations 1..M.
++  - Complete optimizer.step() for local iteration M.
++  - Execute exactly one standard densify_and_prune event after that completed
++    optimizer update.
++  - If iterations_per_packet > M, continue optimizing the modified map.
+ """
+ 
+ from __future__ import annotations
+@@ -1551,7 +1561,68 @@
+         else ssim(image, gt)
+     )
+     loss = (1.0 - opt.lambda_dssim) * ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+-    return loss, ll1, ssim_value, image, gt
++    return loss, ll1, ssim_value, image, gt, render_pkg
++
++
++def run_packet_maintenance(
++    gaussians: GaussianModel,
++    opt,
++    scene: Scene,
++    args,
++    radii: torch.Tensor,
++    packet_id: int,
++    train_step: int,
++    local_iteration: int,
++    global_iteration: int,
++) -> Dict[str, Any]:
++    """Run one standard GraphDECO densification/pruning event.
++
++    The caller must invoke this after optimizer.step() for the selected local
++    iteration. Densification statistics are accumulated before that step.
++    """
++    if args.packet_maintenance_mode != "standard":
++        raise ValueError(f"Unsupported packet maintenance mode: {args.packet_maintenance_mode}")
++
++    count_before = int(gaussians.get_xyz.shape[0])
++    grad_threshold = (
++        float(args.packet_maintenance_grad_threshold)
++        if args.packet_maintenance_grad_threshold > 0
++        else float(opt.densify_grad_threshold)
++    )
++    max_screen_size = (
++        float(args.packet_maintenance_max_screen_size)
++        if args.packet_maintenance_max_screen_size > 0
++        else None
++    )
++
++    t0 = time.time()
++    gaussians.densify_and_prune(
++        grad_threshold,
++        float(args.packet_maintenance_min_opacity),
++        scene.cameras_extent,
++        max_screen_size,
++        radii,
++    )
++    maintenance_sec = time.time() - t0
++    count_after = int(gaussians.get_xyz.shape[0])
++
++    return {
++        "event": "standard_densify_and_prune",
++        "packet_id": int(packet_id),
++        "train_step": int(train_step),
++        "local_iteration": int(local_iteration),
++        "global_iteration": int(global_iteration),
++        "count_before": count_before,
++        "count_after": count_after,
++        "net_change": count_after - count_before,
++        "grad_threshold": grad_threshold,
++        "min_opacity": float(args.packet_maintenance_min_opacity),
++        "max_screen_size": max_screen_size,
++        "world_scale_pruning_enabled": bool(max_screen_size is not None),
++        "maintenance_sec": maintenance_sec,
++        "statistics_source": f"active-local-map renders from local iterations 1-{local_iteration}",
++        "execution_order": "optimizer_step_then_densify_and_prune",
++    }
+ 
+ 
+ @torch.no_grad()
+@@ -1713,6 +1784,23 @@
+         raise ValueError("--split_every must be positive.")
+     if args.eval_every_train_packets <= 0:
+         raise ValueError("--eval_every_train_packets must be positive.")
++    if args.packet_maintenance_mode == "standard":
++        if args.packet_maintenance_after_local_iteration <= 0:
++            raise ValueError(
++                "--packet_maintenance_after_local_iteration must be positive when "
++                "--packet_maintenance_mode standard is used."
++            )
++        if args.packet_maintenance_after_local_iteration > args.iterations_per_packet:
++            raise ValueError(
++                "Packet maintenance iteration cannot exceed --iterations_per_packet."
++            )
++        if args.packet_maintenance_min_opacity < 0:
++            raise ValueError("--packet_maintenance_min_opacity must be non-negative.")
++    elif args.packet_maintenance_after_local_iteration > 0:
++        print(
++            "[warn] --packet_maintenance_after_local_iteration is ignored because "
++            "--packet_maintenance_mode off."
++        )
+     if args.enable_visualization:
+         if args.visualization_width <= 0 or args.visualization_height <= 0:
+             raise ValueError("Visualization width and height must be positive.")
+@@ -1805,6 +1893,8 @@
+     inserted_train_ids: List[int] = []
+     packet_provenance: List[Dict[str, Any]] = []
+     metrics_log: List[Dict[str, Any]] = []
++    maintenance_log: List[Dict[str, Any]] = []
++    cumulative_maintenance_sec = 0.0
+     cumulative_optimization_sec = 0.0
+     cumulative_packet_io_sec = 0.0
+     wall_start = time.time()
+@@ -1854,6 +1944,10 @@
+             "gaussian_start": start_index,
+             "gaussian_end_exclusive": end_index,
+             "num_gaussians": end_index - start_index,
++            "gaussian_range_validity": (
++                "Valid immediately after insertion. Standard densification/pruning "
++                "may later change row indices and counts."
++            ),
+             "fields": fields,
+             "new_packet_opacity_reset": reset_stats,
+             "packet_load_convert_sec": packet_io_sec,
+@@ -1896,6 +1990,13 @@
+             "packet_append_sec": insertion_sec,
+             "cumulative_packet_io_sec": cumulative_packet_io_sec,
+             "cumulative_optimization_sec": cumulative_optimization_sec,
++            "cumulative_maintenance_sec": cumulative_maintenance_sec,
++            "packet_maintenance_mode": args.packet_maintenance_mode,
++            "packet_maintenance_after_local_iteration": (
++                args.packet_maintenance_after_local_iteration
++                if args.packet_maintenance_mode != "off"
++                else None
++            ),
+             "wall_time_sec": time.time() - wall_start,
+         }
+ 
+@@ -1941,6 +2042,7 @@
+ 
+         viewpoint_stack = list(active_local_cameras)
+         ema_loss = 0.0
++        packet_maintenance_event: Optional[Dict[str, Any]] = None
+         optimization_t0 = time.time()
+         pbar = tqdm(
+             range(1, args.iterations_per_packet + 1),
+@@ -1956,12 +2058,28 @@
+             viewpoint = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+             bg = torch.rand(3, device="cuda") if opt.random_background else background
+ 
+-            loss, ll1, ssim_value, image, gt = render_mapping_loss(
++            loss, ll1, ssim_value, image, gt, render_pkg = render_mapping_loss(
+                 viewpoint, scene.gaussians, pipe, bg, dataset, opt
+             )
+             loss.backward()
+ 
+             with torch.no_grad():
++                maintenance_collecting = (
++                    args.packet_maintenance_mode == "standard"
++                    and local_iteration <= args.packet_maintenance_after_local_iteration
++                )
++                if maintenance_collecting:
++                    visibility_filter = render_pkg["visibility_filter"]
++                    radii = render_pkg["radii"]
++                    viewspace_points = render_pkg["viewspace_points"]
++                    scene.gaussians.max_radii2D[visibility_filter] = torch.maximum(
++                        scene.gaussians.max_radii2D[visibility_filter],
++                        radii[visibility_filter],
++                    )
++                    scene.gaussians.add_densification_stats(
++                        viewspace_points, visibility_filter
++                    )
++
+                 ema_loss = 0.4 * float(loss.item()) + 0.6 * ema_loss
+                 if local_iteration % 10 == 0:
+                     pbar.set_postfix(
+@@ -1977,6 +2095,45 @@
+                 scene.gaussians.exposure_optimizer.step()
+                 scene.gaussians.exposure_optimizer.zero_grad(set_to_none=True)
+ 
++                if (
++                    args.packet_maintenance_mode == "standard"
++                    and local_iteration == args.packet_maintenance_after_local_iteration
++                ):
++                    packet_maintenance_event = run_packet_maintenance(
++                        gaussians=scene.gaussians,
++                        opt=opt,
++                        scene=scene,
++                        args=args,
++                        radii=render_pkg["radii"],
++                        packet_id=packet_id,
++                        train_step=train_step,
++                        local_iteration=local_iteration,
++                        global_iteration=global_iteration,
++                    )
++                    maintenance_log.append(packet_maintenance_event)
++                    cumulative_maintenance_sec += float(
++                        packet_maintenance_event["maintenance_sec"]
++                    )
++                    save_json(
++                        Path(dataset.model_path) / "maintenance_log.json",
++                        maintenance_log,
++                    )
++                    print(
++                        "\n[packet maintenance] "
++                        + json.dumps(packet_maintenance_event, indent=2)
++                    )
++                    if wandb_run is not None:
++                        wandb_run.log(
++                            {
++                                "maintenance/count_before": float(packet_maintenance_event["count_before"]),
++                                "maintenance/count_after": float(packet_maintenance_event["count_after"]),
++                                "maintenance/net_change": float(packet_maintenance_event["net_change"]),
++                                "maintenance/sec": float(packet_maintenance_event["maintenance_sec"]),
++                                "maintenance/packet_id": float(packet_id),
++                            },
++                            step=global_iteration,
++                        )
++
+                 if tb_writer is not None:
+                     tb_writer.add_scalar("train/l1", float(ll1.item()), global_iteration)
+                     tb_writer.add_scalar("train/loss", float(loss.item()), global_iteration)
+@@ -2004,7 +2161,13 @@
+                         step=global_iteration,
+                     )
+ 
+-        optimization_this_packet = time.time() - optimization_t0
++        packet_loop_total_sec = time.time() - optimization_t0
++        packet_maintenance_sec = (
++            float(packet_maintenance_event["maintenance_sec"])
++            if packet_maintenance_event is not None
++            else 0.0
++        )
++        optimization_this_packet = max(0.0, packet_loop_total_sec - packet_maintenance_sec)
+         cumulative_optimization_sec += optimization_this_packet
+ 
+         if visualizer is not None:
+@@ -2029,7 +2192,14 @@
+                 {
+                     "global_iteration": global_iteration,
+                     "optimization_sec_this_packet": optimization_this_packet,
++                    "maintenance_sec_this_packet": packet_maintenance_sec,
++                    "update_sec_this_packet": packet_loop_total_sec,
+                     "cumulative_optimization_sec": cumulative_optimization_sec,
++                    "packet_maintenance_event": packet_maintenance_event,
++                    "cumulative_maintenance_sec": cumulative_maintenance_sec,
++                    "cumulative_update_sec": (
++                        cumulative_optimization_sec + cumulative_maintenance_sec
++                    ),
+                     "wall_time_sec": time.time() - wall_start,
+                 }
+             )
+@@ -2102,6 +2272,11 @@
+             "active_packet_ids": final_active_ids,
+             "cumulative_packet_io_sec": cumulative_packet_io_sec,
+             "cumulative_optimization_sec": cumulative_optimization_sec,
++            "cumulative_maintenance_sec": cumulative_maintenance_sec,
++            "cumulative_update_sec": (
++                cumulative_optimization_sec + cumulative_maintenance_sec
++            ),
++            "num_maintenance_events": len(maintenance_log),
+             "wall_time_sec": time.time() - wall_start,
+         },
+         final_inserted_cameras,
+@@ -2123,7 +2298,7 @@
+ 
+     scene.save(global_iteration)
+     summary = {
+-        "script": "train_resplat_3dgs_incremental_local_map_v3_visualization",
++        "script": "train_resplat_3dgs_incremental_local_map_v4_maintenance_visualization",
+         "terminology": {
+             "method": "Incremental Local Gaussian Map Optimization",
+             "active_local_map": "Most recent K inserted train packets/views used to compute optimization loss.",
+@@ -2139,7 +2314,31 @@
+         "iterations_per_packet": args.iterations_per_packet,
+         "reset_new_packet_opacity": bool(args.reset_new_packet_opacity),
+         "new_packet_reset_max_opacity": args.new_packet_reset_max_opacity,
+-        "densification_pruning": "disabled",
++        "densification_pruning": {
++            "mode": args.packet_maintenance_mode,
++            "after_local_iteration": (
++                args.packet_maintenance_after_local_iteration
++                if args.packet_maintenance_mode != "off"
++                else None
++            ),
++            "events": len(maintenance_log),
++            "grad_threshold": (
++                args.packet_maintenance_grad_threshold
++                if args.packet_maintenance_grad_threshold > 0
++                else opt.densify_grad_threshold
++            ),
++            "min_opacity": args.packet_maintenance_min_opacity,
++            "max_screen_size": (
++                args.packet_maintenance_max_screen_size
++                if args.packet_maintenance_max_screen_size > 0
++                else None
++            ),
++            "cumulative_maintenance_sec": cumulative_maintenance_sec,
++            "cumulative_update_sec": (
++                cumulative_optimization_sec + cumulative_maintenance_sec
++            ),
++            "execution_order": "after completed optimizer step at the configured local iteration",
++        },
+         "replay": "not implemented",
+         "isotropic_regularization": "not implemented",
+         "visualization": visualization_summary,
+@@ -2194,6 +2393,48 @@
+     )
+     parser.add_argument("--iterations_per_packet", type=int, default=100)
+     parser.add_argument(
++        "--packet_maintenance_mode",
++        choices=["off", "standard"],
++        default="off",
++        help=(
++            "off: no densification/pruning; standard: execute one GraphDECO "
++            "densify_and_prune event per train packet."
++        ),
++    )
++    parser.add_argument(
++        "--packet_maintenance_after_local_iteration",
++        type=int,
++        default=-1,
++        help=(
++            "Run the one-off per-packet maintenance after optimizer.step() of this "
++            "local iteration. Example: 100."
++        ),
++    )
++    parser.add_argument(
++        "--packet_maintenance_grad_threshold",
++        type=float,
++        default=-1.0,
++        help=(
++            "Gradient threshold for standard densification. <=0 uses "
++            "OptimizationParams.densify_grad_threshold."
++        ),
++    )
++    parser.add_argument(
++        "--packet_maintenance_min_opacity",
++        type=float,
++        default=0.005,
++        help="Low-opacity pruning threshold.",
++    )
++    parser.add_argument(
++        "--packet_maintenance_max_screen_size",
++        type=float,
++        default=-1.0,
++        help=(
++            "Screen-size threshold. <=0 disables screen/world-size pruning and "
++            "keeps only standard gradient densification + low-opacity pruning."
++        ),
++    )
++    parser.add_argument(
+         "--reset_new_packet_opacity",
+         action="store_true",
+         help="Apply original 3DGS-style max-opacity reset only to the newly loaded packet before insertion.",
