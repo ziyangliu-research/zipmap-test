@@ -14,24 +14,34 @@ Pose/scale separation
 - Stereo ZipMap predictions are used only to provide causal scale estimates.
 - Right-camera poses supplied to ReSplat are synthesized from the fixed stereo rig.
 
-Supported scale modes
----------------------
-1) frozen_init (default):
-   Use the scale estimated from the first K stereo pairs for every relative
-   translation increment. The first K frames are conceptually buffered until
-   scale initialization completes.
-
-2) cumulative_online:
-   At frame t, use the scale estimated from the first t+1 stereo pairs only for
+Scale modes
+-----------
+1) frozen_init (default): use the first K stereo pairs to estimate one scale,
+   then apply it to every relative translation increment.
+2) cumulative_online: use the causal scale available at each time step only for
    the newest relative translation increment. Old poses are not rescaled.
+
+ReSplat packet modes
+--------------------
+Legacy mode:
+  --resplat_packet_stage init|final|both
+
+Refinement-ablation mode:
+  --refine_steps 0,4
+
+In refinement-ablation mode the encoder is executed once per frame. refine_0 is
+its raw Gaussian output. forward_update is then executed for the maximum
+requested step count, and refine_N stores the N-th recurrent refinement output.
+Thus refine_0 and refine_4 share exactly the same initial Gaussian prediction.
+--resplat_packet_stage is ignored when --refine_steps is supplied.
 
 Required cached inputs in --pose_experiment_dir
 -----------------------------------------------
 - left_only_predictions.npz
 - prefix_only_inference_summary.json
 
-Example: Frozen-10 packet generation
-------------------------------------
+Main experiment: Frozen-10, no ReSplat refinement
+-------------------------------------------------
 python run_zipmap_resplat_metric_packet_only.py \
   --resplat_repo /home/shiyo/Desktop/Resplat \
   --pose_experiment_dir /home/shiyo/Desktop/ZipMap/outputs/zipmap_stereo_scale_P000_0_50 \
@@ -43,13 +53,13 @@ python run_zipmap_resplat_metric_packet_only.py \
   --resplat_experiment tartanair_p000_ft \
   --scale_mode frozen_init \
   --freeze_after_pairs 10 \
-  --resplat_packet_stage init \
+  --refine_steps 0 \
   --device cuda:0
 
-Example: Cumulative-online packet generation
---------------------------------------------
-Use the same command with:
-  --scale_mode cumulative_online
+ReSplat refinement ablation
+---------------------------
+Use the same command with a different output directory and:
+  --refine_steps 0,4
 """
 
 from __future__ import annotations
@@ -61,7 +71,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -87,6 +97,38 @@ BASE = load_module(
         "run_zipmap_resplat_fusion_api_official_streaming_merged_init_fast.py"
     ),
 )
+
+
+def parse_refine_steps_spec(spec: Optional[str]) -> Optional[list[int]]:
+    """Parse comma-separated refinement counts. Step 0 is raw encoder output."""
+    if spec is None:
+        return None
+    parts = [p.strip() for p in str(spec).replace(";", ",").split(",") if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError(
+            "--refine_steps must not be empty when specified"
+        )
+    values: list[int] = []
+    seen: set[int] = set()
+    for token in parts:
+        try:
+            step = int(token)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"Invalid refine step {token!r}; expected an integer"
+            ) from exc
+        if step < 0:
+            raise argparse.ArgumentTypeError(
+                f"Invalid refine step {step}; expected >= 0"
+            )
+        if step not in seen:
+            values.append(step)
+            seen.add(step)
+    return sorted(values)
+
+
+def refine_stage_name(step: int) -> str:
+    return f"refine_{int(step)}"
 
 
 def save_json(path: Path, obj: Any) -> None:
@@ -213,6 +255,32 @@ def prepare_metric_trajectory(
     return T_raw_all, T_metric, scale_per_frame, scale_summary
 
 
+def attach_packet_metadata(
+    packet: dict[str, Any],
+    *,
+    local_i: int,
+    original_i: int,
+    T_raw: np.ndarray,
+    T_metric: np.ndarray,
+    scale_per_frame: np.ndarray,
+    args: argparse.Namespace,
+    refine_step: Optional[int],
+) -> None:
+    packet.update(
+        {
+            "frame_local_index": int(local_i),
+            "frame_original_index": int(original_i),
+            "raw_left_pose_c2w_opencv": torch.from_numpy(T_raw[local_i]).float(),
+            "metric_left_pose_c2w_opencv": torch.from_numpy(T_metric[local_i]).float(),
+            "scale_mode": str(args.scale_mode),
+            "scale_used_for_increment": float(scale_per_frame[local_i]),
+            "refine_step": None if refine_step is None else int(refine_step),
+            "refine_use_target": bool(args.refine_use_target),
+            "fusion_applied": False,
+        }
+    )
+
+
 @torch.no_grad()
 def generate_packets_save_only(
     runtime: Any,
@@ -224,178 +292,274 @@ def generate_packets_save_only(
 ) -> dict[str, Any]:
     model = runtime.model
     device = runtime.device
-    stage_request = args.resplat_packet_stage
     packet_root = abs_path(args.work_dir) / args.packet_out_name
 
-    stages = ["init", "final"] if stage_request == "both" else [stage_request]
-    for stage in stages:
+    refine_steps = parse_refine_steps_spec(args.refine_steps)
+    refine_compare_mode = refine_steps is not None
+    original_cfg_num_refine = int(getattr(model.encoder.cfg, "num_refine", 0))
+
+    if refine_compare_mode:
+        assert refine_steps is not None
+        max_refine = max(refine_steps)
+        stage_labels = [refine_stage_name(step) for step in refine_steps]
+        if max_refine > 0:
+            if original_cfg_num_refine <= 0 or not hasattr(model.encoder, "update_module"):
+                raise RuntimeError(
+                    "--refine_steps requests refinement, but the loaded ReSplat encoder "
+                    "was built without an update/refine module. Use a config whose "
+                    "model.encoder.num_refine > 0."
+                )
+            model.encoder.cfg.num_refine = int(max_refine)
+            BASE.log(
+                f"[RefineCompare] encoder.cfg.num_refine "
+                f"{original_cfg_num_refine} -> {max_refine}"
+            )
+        stage_request = None
+    else:
+        stage_request = args.resplat_packet_stage
+        stage_labels = (
+            ["init", "final"] if stage_request == "both" else [stage_request]
+        )
+        max_refine = 0
+
+    for stage in stage_labels:
         (packet_root / stage).mkdir(parents=True, exist_ok=True)
 
     timing_rows: list[dict[str, Any]] = []
     packet_records: list[dict[str, Any]] = []
-    stage_counts = {"init": 0, "final": 0}
+    stage_counts = {stage: 0 for stage in stage_labels}
 
     BASE.log(
         f"[Packet-only] ReSplat: {len(selected.indices)} stereo pair(s), "
-        f"stage={stage_request}, scale_mode={args.scale_mode}"
+        f"stages={stage_labels}, scale_mode={args.scale_mode}"
     )
 
-    for local_i, original_i in enumerate(selected.indices):
-        scene_key = f"{args.scene_name}_{local_i:04d}"
-        target_local = local_i + args.resplat_target_offset
-        if target_local < 0 or target_local >= len(selected.indices):
-            if args.drop_invalid_target_offset:
-                continue
-            target_local = max(0, min(target_local, len(selected.indices) - 1))
-        target_original_i = selected.indices[target_local]
+    try:
+        for local_i, original_i in enumerate(selected.indices):
+            scene_key = f"{args.scene_name}_{local_i:04d}"
+            target_local = local_i + args.resplat_target_offset
+            if target_local < 0 or target_local >= len(selected.indices):
+                if args.drop_invalid_target_offset:
+                    continue
+                target_local = max(0, min(target_local, len(selected.indices) - 1))
+            target_original_i = selected.indices[target_local]
 
-        t0 = time.perf_counter()
-        batch_cpu = BASE.make_resplat_batch_for_frame(
-            runtime=runtime,
-            scene_key=scene_key,
-            frame_index=original_i,
-            left_path=selected.left_paths[local_i],
-            right_path=selected.right_paths[local_i],
-            T_left_c2w_cv=T_metric[local_i],
-            target_camera=args.resplat_target_camera,
-            target_offset_frame_index=target_original_i,
-            target_left_path=selected.left_paths[target_local],
-            target_right_path=selected.right_paths[target_local],
-            target_T_left_c2w_cv=T_metric[target_local],
-            stereo_baseline=args.stereo_baseline,
-        )
-        batch = BASE.tensor_to_device(batch_cpu, device)
-        batch = model.data_shim(batch)
-        cuda_sync(device)
-        preprocess_sec = time.perf_counter() - t0
-
-        t1 = time.perf_counter()
-        enc_out = model.encoder(
-            batch["context"],
-            0,
-            deterministic=False,
-            visualization_dump=None,
-        )
-        cuda_sync(device)
-        encoder_sec = time.perf_counter() - t1
-
-        if isinstance(enc_out, dict):
-            condition_features = enc_out.get("condition_features", None)
-            gaussians_init = enc_out["gaussians"]
-        else:
-            condition_features = None
-            gaussians_init = enc_out
-
-        saved_paths: dict[str, str] = {}
-        refine_sec = 0.0
-
-        if stage_request in {"init", "both"}:
-            pkt_init = BASE.make_packet_from_gaussians(
-                gaussians_init, batch, model.decoder, stage="init"
+            t0 = time.perf_counter()
+            batch_cpu = BASE.make_resplat_batch_for_frame(
+                runtime=runtime,
+                scene_key=scene_key,
+                frame_index=original_i,
+                left_path=selected.left_paths[local_i],
+                right_path=selected.right_paths[local_i],
+                T_left_c2w_cv=T_metric[local_i],
+                target_camera=args.resplat_target_camera,
+                target_offset_frame_index=target_original_i,
+                target_left_path=selected.left_paths[target_local],
+                target_right_path=selected.right_paths[target_local],
+                target_T_left_c2w_cv=T_metric[target_local],
+                stereo_baseline=args.stereo_baseline,
             )
-            pkt_init.update(
-                {
-                    "frame_local_index": int(local_i),
-                    "frame_original_index": int(original_i),
-                    "raw_left_pose_c2w_opencv": torch.from_numpy(T_raw[local_i]).float(),
-                    "metric_left_pose_c2w_opencv": torch.from_numpy(T_metric[local_i]).float(),
-                    "scale_mode": str(args.scale_mode),
-                    "scale_used_for_increment": float(scale_per_frame[local_i]),
-                    "fusion_applied": False,
-                }
-            )
-            out_path = packet_root / "init" / f"{scene_key}.pt"
-            torch.save(pkt_init, out_path)
-            saved_paths["init"] = str(out_path)
-            stage_counts["init"] += 1
-            del pkt_init
+            batch = BASE.tensor_to_device(batch_cpu, device)
+            batch = model.data_shim(batch)
+            cuda_sync(device)
+            preprocess_sec = time.perf_counter() - t0
 
-        if stage_request in {"final", "both"}:
-            gaussians_final = gaussians_init
-            if getattr(model.encoder.cfg, "num_refine", 0) > 0:
-                if condition_features is None:
-                    raise RuntimeError(
-                        "encoder.num_refine > 0 but condition_features are unavailable"
+            t_encoder = time.perf_counter()
+            enc_out = model.encoder(
+                batch["context"],
+                0,
+                deterministic=False,
+                visualization_dump=None,
+            )
+            cuda_sync(device)
+            encoder_sec = time.perf_counter() - t_encoder
+
+            if isinstance(enc_out, dict):
+                condition_features = enc_out.get("condition_features", None)
+                gaussians_init = enc_out["gaussians"]
+            else:
+                condition_features = None
+                gaussians_init = enc_out
+
+            saved_paths: dict[str, str] = {}
+            refine_sec = 0.0
+            refine_out = None
+
+            if refine_compare_mode:
+                assert refine_steps is not None
+                if max_refine > 0:
+                    if condition_features is None:
+                        raise RuntimeError(
+                            "Refinement was requested but encoder output did not contain "
+                            "condition_features. Check the ReSplat encoder config."
+                        )
+                    t_refine = time.perf_counter()
+                    refine_out = model.encoder.forward_update(
+                        batch["context"],
+                        batch["target"] if args.refine_use_target else None,
+                        condition_features,
+                        gaussians_init,
+                        model.decoder,
+                        batch.get("context_remain", None),
                     )
-                t_refine = time.perf_counter()
-                refine_out = model.encoder.forward_update(
-                    batch["context"],
-                    None,
-                    condition_features,
-                    gaussians_init,
-                    model.decoder,
-                    batch.get("context_remain", None),
-                )
-                cuda_sync(device)
-                refine_sec = time.perf_counter() - t_refine
-                if len(refine_out["gaussian"]) == 0:
-                    raise RuntimeError("forward_update returned no Gaussian output")
-                gaussians_final = refine_out["gaussian"][-1]
+                    cuda_sync(device)
+                    refine_sec = time.perf_counter() - t_refine
+                    if len(refine_out["gaussian"]) < max_refine:
+                        raise RuntimeError(
+                            f"forward_update returned {len(refine_out['gaussian'])} outputs, "
+                            f"but --refine_steps requested {max_refine}"
+                        )
 
-            pkt_final = BASE.make_packet_from_gaussians(
-                gaussians_final, batch, model.decoder, stage="final"
-            )
-            pkt_final.update(
+                for step in refine_steps:
+                    stage = refine_stage_name(step)
+                    gaussians = (
+                        gaussians_init
+                        if step == 0
+                        else refine_out["gaussian"][step - 1]
+                    )
+                    packet = BASE.make_packet_from_gaussians(
+                        gaussians, batch, model.decoder, stage=stage
+                    )
+                    attach_packet_metadata(
+                        packet,
+                        local_i=local_i,
+                        original_i=original_i,
+                        T_raw=T_raw,
+                        T_metric=T_metric,
+                        scale_per_frame=scale_per_frame,
+                        args=args,
+                        refine_step=step,
+                    )
+                    out_path = packet_root / stage / f"{scene_key}.pt"
+                    torch.save(packet, out_path)
+                    saved_paths[stage] = str(out_path)
+                    stage_counts[stage] += 1
+                    del packet
+            else:
+                assert stage_request is not None
+                if stage_request in {"init", "both"}:
+                    packet = BASE.make_packet_from_gaussians(
+                        gaussians_init, batch, model.decoder, stage="init"
+                    )
+                    attach_packet_metadata(
+                        packet,
+                        local_i=local_i,
+                        original_i=original_i,
+                        T_raw=T_raw,
+                        T_metric=T_metric,
+                        scale_per_frame=scale_per_frame,
+                        args=args,
+                        refine_step=0,
+                    )
+                    out_path = packet_root / "init" / f"{scene_key}.pt"
+                    torch.save(packet, out_path)
+                    saved_paths["init"] = str(out_path)
+                    stage_counts["init"] += 1
+                    del packet
+
+                if stage_request in {"final", "both"}:
+                    gaussians_final = gaussians_init
+                    configured_steps = int(getattr(model.encoder.cfg, "num_refine", 0))
+                    if configured_steps > 0:
+                        if condition_features is None:
+                            raise RuntimeError(
+                                "encoder.num_refine > 0 but condition_features are unavailable"
+                            )
+                        t_refine = time.perf_counter()
+                        refine_out = model.encoder.forward_update(
+                            batch["context"],
+                            None,
+                            condition_features,
+                            gaussians_init,
+                            model.decoder,
+                            batch.get("context_remain", None),
+                        )
+                        cuda_sync(device)
+                        refine_sec = time.perf_counter() - t_refine
+                        if len(refine_out["gaussian"]) == 0:
+                            raise RuntimeError(
+                                "forward_update returned no Gaussian output"
+                            )
+                        gaussians_final = refine_out["gaussian"][-1]
+
+                    packet = BASE.make_packet_from_gaussians(
+                        gaussians_final, batch, model.decoder, stage="final"
+                    )
+                    attach_packet_metadata(
+                        packet,
+                        local_i=local_i,
+                        original_i=original_i,
+                        T_raw=T_raw,
+                        T_metric=T_metric,
+                        scale_per_frame=scale_per_frame,
+                        args=args,
+                        refine_step=configured_steps,
+                    )
+                    out_path = packet_root / "final" / f"{scene_key}.pt"
+                    torch.save(packet, out_path)
+                    saved_paths["final"] = str(out_path)
+                    stage_counts["final"] += 1
+                    del packet
+
+            total_sec = time.perf_counter() - t0
+            timing_rows.append(
                 {
                     "frame_local_index": int(local_i),
                     "frame_original_index": int(original_i),
-                    "raw_left_pose_c2w_opencv": torch.from_numpy(T_raw[local_i]).float(),
-                    "metric_left_pose_c2w_opencv": torch.from_numpy(T_metric[local_i]).float(),
-                    "scale_mode": str(args.scale_mode),
-                    "scale_used_for_increment": float(scale_per_frame[local_i]),
-                    "fusion_applied": False,
+                    "preprocess_and_shim_sec": float(preprocess_sec),
+                    "encoder_sec": float(encoder_sec),
+                    "refine_sec": float(refine_sec),
+                    "max_refine_step_executed": int(max_refine)
+                    if refine_compare_mode
+                    else int(getattr(model.encoder.cfg, "num_refine", 0))
+                    if stage_request in {"final", "both"}
+                    else 0,
+                    "total_packet_sec": float(total_sec),
                 }
             )
-            out_path = packet_root / "final" / f"{scene_key}.pt"
-            torch.save(pkt_final, out_path)
-            saved_paths["final"] = str(out_path)
-            stage_counts["final"] += 1
-            del pkt_final
-            if "refine_out" in locals():
-                del refine_out
-
-        total_sec = time.perf_counter() - t0
-        timing_rows.append(
-            {
-                "frame_local_index": int(local_i),
-                "frame_original_index": int(original_i),
-                "preprocess_and_shim_sec": float(preprocess_sec),
-                "encoder_sec": float(encoder_sec),
-                "refine_sec": float(refine_sec),
-                "total_packet_sec": float(total_sec),
-            }
-        )
-        packet_records.append(
-            {
-                "scene": scene_key,
-                "frame_local_index": int(local_i),
-                "frame_original_index": int(original_i),
-                "left_image": str(selected.left_paths[local_i]),
-                "right_image": str(selected.right_paths[local_i]),
-                "scale_used_for_increment": float(scale_per_frame[local_i]),
-                "saved_packets": saved_paths,
-            }
-        )
-
-        del batch, batch_cpu, enc_out, gaussians_init
-        if "gaussians_final" in locals():
-            del gaussians_final
-        if (local_i + 1) % max(1, args.empty_cache_every) == 0:
-            torch.cuda.empty_cache()
-
-        if (local_i + 1) % max(1, args.log_every) == 0 or local_i + 1 == len(selected.indices):
-            BASE.log(
-                f"  generated {local_i + 1}/{len(selected.indices)} packet(s), "
-                f"last={total_sec:.3f}s"
+            packet_records.append(
+                {
+                    "scene": scene_key,
+                    "frame_local_index": int(local_i),
+                    "frame_original_index": int(original_i),
+                    "left_image": str(selected.left_paths[local_i]),
+                    "right_image": str(selected.right_paths[local_i]),
+                    "scale_used_for_increment": float(scale_per_frame[local_i]),
+                    "saved_packets": saved_paths,
+                }
             )
+
+            del batch, batch_cpu, enc_out, gaussians_init
+            if refine_out is not None:
+                del refine_out
+            if "gaussians_final" in locals():
+                del gaussians_final
+            if (local_i + 1) % max(1, args.empty_cache_every) == 0:
+                torch.cuda.empty_cache()
+
+            if (
+                (local_i + 1) % max(1, args.log_every) == 0
+                or local_i + 1 == len(selected.indices)
+            ):
+                BASE.log(
+                    f"  generated {local_i + 1}/{len(selected.indices)} frame(s), "
+                    f"last={total_sec:.3f}s"
+                )
+    finally:
+        model.encoder.cfg.num_refine = original_cfg_num_refine
 
     save_csv(packet_root / "packet_timing.csv", timing_rows)
     manifest = {
         "pipeline": "ZipMap metric pose -> ReSplat packet only",
         "scale_mode": args.scale_mode,
-        "packet_stage_requested": stage_request,
-        "num_init_packets": stage_counts["init"],
-        "num_final_packets": stage_counts["final"],
+        "refine_compare_mode": bool(refine_compare_mode),
+        "refine_steps": None
+        if refine_steps is None
+        else [int(step) for step in refine_steps],
+        "refine_use_target": bool(args.refine_use_target),
+        "original_encoder_num_refine": int(original_cfg_num_refine),
+        "packet_stage_requested": args.resplat_packet_stage,
+        "packet_counts": stage_counts,
         "selected_original_indices": [int(i) for i in selected.indices],
         "stereo_baseline": float(args.stereo_baseline),
         "fusion_performed": False,
@@ -438,6 +602,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--resplat_packet_stage",
         choices=["init", "final", "both"],
         default="init",
+        help="Legacy packet mode. Ignored when --refine_steps is supplied.",
+    )
+    p.add_argument(
+        "--refine_steps",
+        default=None,
+        help=(
+            "Comma-separated refinement counts to save, e.g. 0,4. "
+            "Step 0 is raw encoder output."
+        ),
+    )
+    p.add_argument(
+        "--refine_use_target",
+        type=BASE.str2bool,
+        default=False,
+        help=(
+            "Pass target views to forward_update. Default false matches the "
+            "existing packet-generation path."
+        ),
     )
     p.add_argument(
         "--resplat_target_camera",
@@ -464,6 +646,13 @@ def main() -> None:
     args.work_dir = str(abs_path(args.work_dir))
     work_dir = abs_path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
+
+    refine_steps = parse_refine_steps_spec(args.refine_steps)
+    if refine_steps is not None:
+        BASE.log(
+            f"[RefineCompare] requested steps={refine_steps}; "
+            "--resplat_packet_stage is ignored"
+        )
 
     selected = BASE.select_stereo_frames(
         left_dir=abs_path(args.left_dir),
@@ -507,17 +696,21 @@ def main() -> None:
         {
             "scale": scale_summary,
             "num_frames": len(selected.indices),
-            "packet_manifest": str(work_dir / args.packet_out_name / "manifest.json"),
+            "refine_steps": None
+            if refine_steps is None
+            else [int(step) for step in refine_steps],
+            "refine_use_target": bool(args.refine_use_target),
+            "packet_manifest": str(
+                work_dir / args.packet_out_name / "manifest.json"
+            ),
             "fusion_performed": False,
             "visualization_performed": False,
-            "packet_counts": {
-                "init": manifest["num_init_packets"],
-                "final": manifest["num_final_packets"],
-            },
+            "packet_counts": manifest["packet_counts"],
         },
     )
     print(f"[Done] packets: {work_dir / args.packet_out_name}")
 
 
 if __name__ == "__main__":
+    torch.set_float32_matmul_precision("high")
     main()
