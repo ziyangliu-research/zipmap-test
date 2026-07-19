@@ -9,7 +9,7 @@ import torch
 EXT={'.jpg','.jpeg','.png','.bmp','.tif','.tiff','.webp'}
 def b(v):
     if isinstance(v,bool): return v
-    s=v.lower();
+    s=v.lower()
     if s in {'1','true','yes','y'}: return True
     if s in {'0','false','no','n'}: return False
     raise argparse.ArgumentTypeError(v)
@@ -61,7 +61,7 @@ def infer(model,paths,a,d,ex):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--zipmap_repo',required=True); p.add_argument('--zipmap_ckpt',required=True)
-    p.add_argument('--left_dir',required=True); p.add_argument('--right_dir'); p.add_argument('--gt_pose_file',required=True); p.add_argument('--output_dir',required=True)
+    p.add_argument('--left_dir',required=True); p.add_argument('--right_dir'); p.add_argument('--gt_pose_file',default=None); p.add_argument('--output_dir',required=True)
     p.add_argument('--mode',choices=['mono_pair','stereo_pair'],required=True); p.add_argument('--start_index',type=int,default=0); p.add_argument('--end_index',type=int)
     p.add_argument('--stride',type=int,default=1); p.add_argument('--max_frames',type=int); p.add_argument('--recursive',action='store_true'); p.add_argument('--device',default='cuda:0')
     p.add_argument('--ema',type=b,default=False); p.add_argument('--affine_invariant',type=b,default=True); p.add_argument('--pose_only_heads',type=b,default=True)
@@ -90,14 +90,20 @@ def main():
         for k in total: total[k]+=tm[k]
         rows.append({'pair':i,'frame_t':ids[i],'frame_t1':ids[i+1],'scale':s,'baseline_t':b0,'baseline_t1':b1,'scale_t':s0,'scale_t1':s1,**tm})
         print(f'[{i+1}/{len(ids)-1}] {ids[i]}->{ids[i+1]} scale={s:.6f} time={tm["total"]:.4f}s',flush=True)
-    GTall=ev.load_gt_trajectory(ap(a.gt_pose_file),a.gt_convention,a.gt_quat_order,a.gt_matrix_convention); GT=GTall[np.asarray(ids)]
-    ev.write_pose_tum(out/'trajectory_raw_c2w_opencv.txt',T,names=[L[j].name for j in ids]); ev.write_pose_tum(out/'trajectory_gt_matched_c2w_opencv.txt',GT,names=[L[j].name for j in ids])
-    E={}; arrays={'T_raw_accumulated_c2w_opencv':T.astype(np.float32),'T_gt_matched_c2w_opencv':GT.astype(np.float32),'T_pair_local_c2w_opencv':np.stack(locals),'pair_intrinsics':np.stack(Ks),'selected_original_indices':np.asarray(ids),'scale_per_pair':np.asarray(scales,dtype=np.float32)}
-    for name,ws in [('se3',False),('sim3',True)]:
-        s,Q,t=ev.umeyama_alignment(T[:,:3,3],GT[:,:3,3],with_scale=ws); A=ev.apply_similarity_to_poses(T,s,Q,t); ate=ev.compute_ate(A,GT); rr,rpe=ev.compute_rpe(A,GT,a.rpe_delta)
-        E[name]={'alignment_scale':s,'alignment_rotation':Q.tolist(),'alignment_translation':t.tolist(),'ate':ate,'rpe':rpe}; arrays[f'T_{name}_aligned_c2w_opencv']=A.astype(np.float32)
-        ev.write_pose_tum(out/f'trajectory_{name}_aligned_c2w_opencv.txt',A,names=[L[j].name for j in ids]); csvout(out/f'rpe_errors_{name}.csv',rr)
+    ev.write_pose_tum(out/'trajectory_raw_c2w_opencv.txt',T,names=[L[j].name for j in ids])
+    arrays={'T_raw_accumulated_c2w_opencv':T.astype(np.float32),'T_pair_local_c2w_opencv':np.stack(locals),'pair_intrinsics':np.stack(Ks),'selected_original_indices':np.asarray(ids),'scale_per_pair':np.asarray(scales,dtype=np.float32)}
+    E={}
+    if a.gt_pose_file:
+        GTall=ev.load_gt_trajectory(ap(a.gt_pose_file),a.gt_convention,a.gt_quat_order,a.gt_matrix_convention); GT=GTall[np.asarray(ids)]
+        arrays['T_gt_matched_c2w_opencv']=GT.astype(np.float32)
+        ev.write_pose_tum(out/'trajectory_gt_matched_c2w_opencv.txt',GT,names=[L[j].name for j in ids])
+        for name,ws in [('se3',False),('sim3',True)]:
+            s,Q,t=ev.umeyama_alignment(T[:,:3,3],GT[:,:3,3],with_scale=ws); A=ev.apply_similarity_to_poses(T,s,Q,t); ate=ev.compute_ate(A,GT); rr,rpe=ev.compute_rpe(A,GT,a.rpe_delta)
+            E[name]={'alignment_scale':s,'alignment_rotation':Q.tolist(),'alignment_translation':t.tolist(),'ate':ate,'rpe':rpe}; arrays[f'T_{name}_aligned_c2w_opencv']=A.astype(np.float32)
+            ev.write_pose_tum(out/f'trajectory_{name}_aligned_c2w_opencv.txt',A,names=[L[j].name for j in ids]); csvout(out/f'rpe_errors_{name}.csv',rr)
     np.savez_compressed(out/'pairwise_pose_results.npz',**arrays); csvout(out/'pairwise_steps.csv',rows)
-    ss=np.asarray(scales); summary={'mode':a.mode,'pairwise_state_policy':'independent forward per adjacent pair; returned TTT state discarded','num_frames':len(ids),'num_pairs':len(ids)-1,'selected_original_indices':ids,'timing':{**total,'total_per_pair':total['total']/(len(ids)-1)},'scale_statistics':{'mean':float(ss.mean()),'median':float(np.median(ss)),'std':float(ss.std()),'min':float(ss.min()),'max':float(ss.max())},'evaluation':E,'model':load,'plots_generated':False}
-    js(out/'summary.json',summary); print(f"SE3 ATE={E['se3']['ate']['rmse']:.6f} Sim3 ATE={E['sim3']['ate']['rmse']:.6f}")
+    ss=np.asarray(scales); summary={'mode':a.mode,'pairwise_state_policy':'independent forward per adjacent pair; returned TTT state discarded','num_frames':len(ids),'num_pairs':len(ids)-1,'selected_original_indices':ids,'timing':{**total,'total_per_pair':total['total']/(len(ids)-1)},'scale_statistics':{'mean':float(ss.mean()),'median':float(np.median(ss)),'std':float(ss.std()),'min':float(ss.min()),'max':float(ss.max())},'gt_used':bool(a.gt_pose_file),'evaluation':E,'model':load,'plots_generated':False}
+    js(out/'summary.json',summary)
+    if E: print(f"SE3 ATE={E['se3']['ate']['rmse']:.6f} Sim3 ATE={E['sim3']['ate']['rmse']:.6f}")
+    else: print('[Done] trajectory generated without GT evaluation')
 if __name__=='__main__': main()
