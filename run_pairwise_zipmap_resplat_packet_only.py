@@ -119,11 +119,6 @@ def main() -> None:
             "--gt_matrix_convention", args.gt_matrix_convention,
             "--rpe_delta", str(args.rpe_delta),
         ]
-    else:
-        raise ValueError(
-            "The current pairwise evaluator requires --gt_pose_file. "
-            "GT is used only for post-hoc metrics, not for pose estimation or packets."
-        )
 
     pose_sec = run(pose_cmd, "1/2 Pairwise metric pose")
 
@@ -170,7 +165,10 @@ def main() -> None:
         "total_sec": pose_sec + packet_sec,
         "pose_output": str(pose_dir / "pairwise_pose_results.npz"),
         "packet_output": str(work / args.packet_out_name),
-        "gt_usage": "evaluation only; not used for pose accumulation, metric scale, or packet generation",
+        "gt_usage": (
+            "evaluation only; not used for pose accumulation, metric scale, or packet generation"
+            if args.gt_pose_file else "not provided"
+        ),
     }
     (work / "combined_pipeline_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
